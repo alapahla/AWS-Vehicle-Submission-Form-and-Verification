@@ -465,8 +465,9 @@
   <footer class="site-footer">Powered by <a href="https://southwesterncms.com" target="_blank" rel="noopener noreferrer" style="color:#808080;text-decoration:underline;text-underline-offset:2px;">Southwestern CMS</a></footer>
 
   <script>
+    const MAX_FILE_SIZE_MB = 10;
     const MAX_VEHICLE_PHOTOS = 2;
-    const API_ENDPOINT = 'YOUR_API_GATEWAY_ENDPOINT_HERE';
+    const API_BASE = 'https://en4maiqyve.execute-api.us-east-1.amazonaws.com';
     const CALENDLY_URL = 'YOUR_CALENDLY_URL_HERE';
 
     let vehicleFiles = [];
@@ -499,7 +500,7 @@
           btn.onclick = () => {
             vehicleFiles.splice(index, 1);
             renderVehicleThumbs();
-            setFeedback('vehicle-feedback', vehicleFiles.length === 0 ? '' : '', false);
+            setFeedback('vehicle-feedback', '', false);
           };
           wrap.appendChild(img);
           wrap.appendChild(btn);
@@ -595,11 +596,24 @@
       if (typeof turnstile !== 'undefined') turnstile.reset();
     }
 
+    async function uploadToS3(presignedUrl, file) {
+      const response = await fetch(presignedUrl, {
+        method: 'PUT',
+        body: file,
+        headers: { 'Content-Type': 'image/jpeg' }
+      });
+      if (!response.ok) throw new Error(`Upload failed for ${file.name}`);
+    }
+
     async function handleSubmit() {
       const titleFiles = document.getElementById('title-input').files;
       const vinFiles = document.getElementById('vin-input').files;
 
-      if (vehicleFiles.length === 0 || titleFiles.length === 0 || vinFiles.length === 0) {
+      if (vehicleFiles.length < MAX_VEHICLE_PHOTOS) {
+        alert(`Please upload both vehicle photos before submitting.`);
+        return;
+      }
+      if (titleFiles.length === 0 || vinFiles.length === 0) {
         alert('Please upload all required photos before submitting.');
         return;
       }
@@ -614,18 +628,35 @@
       show('loading-section');
 
       try {
-        const formData = new FormData();
-        vehicleFiles.forEach(f => formData.append('vehicle', f));
-        formData.append('title', titleFiles[0]);
-        formData.append('vin', vinFiles[0]);
-        formData.append('turnstile', turnstileToken.value);
-
-        const response = await fetch(API_ENDPOINT, {
+        // Step 1 — request presigned URLs
+        const presignResponse = await fetch(`${API_BASE}/presign`, {
           method: 'POST',
-          body: formData
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ turnstile: turnstileToken.value })
         });
 
-        const result = await response.json();
+        if (!presignResponse.ok) {
+          throw new Error('Security check failed');
+        }
+
+        const { urls, keys } = await presignResponse.json();
+
+        // Step 2 — upload all photos directly to S3 simultaneously
+        await Promise.all([
+          uploadToS3(urls.vehicle_0, vehicleFiles[0]),
+          uploadToS3(urls.vehicle_1, vehicleFiles[1]),
+          uploadToS3(urls.title, titleFiles[0]),
+          uploadToS3(urls.vin, vinFiles[0])
+        ]);
+
+        // Step 3 — trigger verification
+        const verifyResponse = await fetch(`${API_BASE}/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ keys })
+        });
+
+        const result = await verifyResponse.json();
         hide('loading-section');
 
         if (result.verified === true) {
@@ -634,7 +665,9 @@
         } else {
           show('fail-section');
         }
+
       } catch (err) {
+        console.error(err);
         hide('loading-section');
         show('fail-section');
       }
