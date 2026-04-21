@@ -6,6 +6,7 @@ A web-based submission form that allows sellers of free vehicles listed on Faceb
 ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 Architecture
+
 This system uses the following services:
 
 - S3 (form bucket) — hosts the static HTML submission form
@@ -21,6 +22,7 @@ This system uses the following services:
 ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 Criteria for Approval
+
 A submission is approved if both of the following are met:
 
 - The VIN on the vehicle matches the VIN on the title (verified by Textract)
@@ -38,6 +40,7 @@ Security
 ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 Cost Estimate
+
 Approximately $0.005 per submission. Textract dominates at ~$0.0045. Rekognition adds ~$0.0002. Fixed monthly costs for CloudFront and Route 53 are approximately $0.50 to $1.00. CloudWatch alarms add approximately $0.20 to $0.30 per month.
 
 ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
