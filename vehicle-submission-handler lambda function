@@ -4,17 +4,18 @@ import urllib.request
 import urllib.parse
 import base64
 import concurrent.futures
-import os
 import uuid
+import os
 
 s3 = boto3.client('s3')
 textract = boto3.client('textract')
 rekognition = boto3.client('rekognition')
 
-UPLOADS_BUCKET = 'vehicle-submission-uploads'
-TURNSTILE_SECRET = 'YOUR_TURNSTILE_SECRET_KEY_HERE'
+UPLOADS_BUCKET = os.environ['UPLOADS_BUCKET']
+TURNSTILE_SECRET = os.environ['TURNSTILE_SECRET']
 WHEEL_CONFIDENCE_THRESHOLD = 90.0
 WHEEL_LABELS = {'wheel', 'tire', 'tyre', 'alloy wheel', 'spoke'}
+PRESIGN_EXPIRY = 300
 
 def verify_turnstile(token, remote_ip):
     data = urllib.parse.urlencode({
@@ -31,30 +32,38 @@ def verify_turnstile(token, remote_ip):
         result = json.loads(res.read())
     return result.get('success', False)
 
-def upload_to_s3(file_bytes, key):
-    s3.put_object(
-        Bucket=UPLOADS_BUCKET,
-        Key=key,
-        Body=file_bytes
-    )
-    return key
+def generate_presigned_urls(submission_id):
+    keys = {
+        'vehicle_0': f'{submission_id}/vehicle_0.jpg',
+        'vehicle_1': f'{submission_id}/vehicle_1.jpg',
+        'title':     f'{submission_id}/title.jpg',
+        'vin':       f'{submission_id}/vin.jpg',
+    }
+    urls = {}
+    for field, key in keys.items():
+        urls[field] = s3.generate_presigned_url(
+            'put_object',
+            Params={
+                'Bucket': UPLOADS_BUCKET,
+                'Key': key,
+                'ContentType': 'image/jpeg'
+            },
+            ExpiresIn=PRESIGN_EXPIRY
+        )
+    return urls, keys
 
-def extract_vin_from_image(image_bytes):
+def extract_vin(image_bytes):
     response = textract.detect_document_text(
         Document={'Bytes': image_bytes}
     )
-    lines = [
-        block['Text']
-        for block in response['Blocks']
-        if block['BlockType'] == 'LINE'
-    ]
-    for line in lines:
-        cleaned = line.strip().replace(' ', '').upper()
-        if len(cleaned) == 17 and cleaned.isalnum():
-            return cleaned
+    for block in response['Blocks']:
+        if block['BlockType'] == 'LINE':
+            cleaned = block['Text'].strip().replace(' ', '').upper()
+            if len(cleaned) == 17 and cleaned.isalnum():
+                return cleaned
     return None
 
-def detect_wheels(image_bytes):
+def detect_wheels_in_image(image_bytes):
     response = rekognition.detect_labels(
         Image={'Bytes': image_bytes},
         MaxLabels=50,
@@ -66,132 +75,97 @@ def detect_wheels(image_bytes):
                 return True, label['Confidence']
     return False, 0.0
 
-def parse_multipart(body, content_type):
-    boundary = None
-    for part in content_type.split(';'):
-        part = part.strip()
-        if part.startswith('boundary='):
-            boundary = part[9:].strip('"')
-            break
-    if not boundary:
-        raise ValueError('No boundary found in content type')
+def get_s3_object(key):
+    response = s3.get_object(Bucket=UPLOADS_BUCKET, Key=key)
+    return response['Body'].read()
 
-    files = {}
-    boundary_bytes = ('--' + boundary).encode()
-    parts = body.split(boundary_bytes)
+def handle_presign(event):
+    body = parse_json_body(event)
+    turnstile_token = body.get('turnstile', '')
+    remote_ip = (event.get('requestContext', {})
+                 .get('http', {})
+                 .get('sourceIp', ''))
 
-    for part in parts[1:]:
-        if part in (b'', b'--\r\n', b'--'):
-            continue
-        if b'\r\n\r\n' not in part:
-            continue
-        headers_raw, content = part.split(b'\r\n\r\n', 1)
-        content = content.rstrip(b'\r\n--')
-        headers_str = headers_raw.decode('utf-8', errors='ignore')
+    if not verify_turnstile(turnstile_token, remote_ip):
+        return response(400, {'error': 'Security check failed'})
 
-        name = None
-        for header_line in headers_str.split('\r\n'):
-            if 'Content-Disposition' in header_line:
-                for segment in header_line.split(';'):
-                    segment = segment.strip()
-                    if segment.startswith('name='):
-                        name = segment[5:].strip('"')
+    submission_id = str(uuid.uuid4())
+    urls, keys = generate_presigned_urls(submission_id)
 
-        if name:
-            if name in files:
-                if isinstance(files[name], list):
-                    files[name].append(content)
-                else:
-                    files[name] = [files[name], content]
-            else:
-                files[name] = content
+    return response(200, {
+        'submission_id': submission_id,
+        'urls': urls,
+        'keys': keys
+    })
 
-    return files
+def handle_verify(event):
+    body = parse_json_body(event)
+    keys = body.get('keys', {})
+
+    required = ['vehicle_0', 'vehicle_1', 'title', 'vin']
+    if not all(k in keys for k in required):
+        return response(400, {'verified': False, 'reason': 'Missing file keys'})
+
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        future_vehicle_0 = executor.submit(get_s3_object, keys['vehicle_0'])
+        future_vehicle_1 = executor.submit(get_s3_object, keys['vehicle_1'])
+        future_title     = executor.submit(get_s3_object, keys['title'])
+        future_vin       = executor.submit(get_s3_object, keys['vin'])
+
+        vehicle_0_bytes = future_vehicle_0.result()
+        vehicle_1_bytes = future_vehicle_1.result()
+        title_bytes     = future_title.result()
+        vin_bytes       = future_vin.result()
+
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        future_vin_from_vin_photo = executor.submit(extract_vin, vin_bytes)
+        future_vin_from_title     = executor.submit(extract_vin, title_bytes)
+        future_wheels_0           = executor.submit(detect_wheels_in_image, vehicle_0_bytes)
+        future_wheels_1           = executor.submit(detect_wheels_in_image, vehicle_1_bytes)
+
+        vin_from_vin_photo = future_vin_from_vin_photo.result()
+        vin_from_title     = future_vin_from_title.result()
+        wheels_0_found, confidence_0 = future_wheels_0.result()
+        wheels_1_found, confidence_1 = future_wheels_1.result()
+
+    if not vin_from_vin_photo:
+        return response(200, {'verified': False,
+                              'reason': 'Could not read VIN from VIN photo'})
+
+    if not vin_from_title:
+        return response(200, {'verified': False,
+                              'reason': 'Could not read VIN from title photo'})
+
+    if vin_from_vin_photo != vin_from_title:
+        return response(200, {'verified': False,
+                              'reason': 'VIN does not match title'})
+
+    if not wheels_0_found:
+        return response(200, {'verified': False,
+                              'reason': 'Could not confirm wheels in first vehicle photo'})
+
+    if not wheels_1_found:
+        return response(200, {'verified': False,
+                              'reason': 'Could not confirm wheels in second vehicle photo'})
+
+    return response(200, {'verified': True})
+
+def parse_json_body(event):
+    body = event.get('body', '{}')
+    if event.get('isBase64Encoded', False):
+        body = base64.b64decode(body).decode('utf-8')
+    return json.loads(body)
 
 def lambda_handler(event, context):
     try:
-        content_type = event['headers'].get(
-            'content-type') or event['headers'].get('Content-Type', '')
-        is_base64 = event.get('isBase64Encoded', False)
-        body = event.get('body', '')
+        path = event.get('rawPath', '')
 
-        if is_base64:
-            body = base64.b64decode(body)
+        if path == '/presign':
+            return handle_presign(event)
+        elif path == '/verify':
+            return handle_verify(event)
         else:
-            body = body.encode('utf-8')
-
-        files = parse_multipart(body, content_type)
-
-        turnstile_token = files.get('turnstile', b'').decode('utf-8', errors='ignore').strip()
-        remote_ip = event.get('requestContext', {}).get(
-            'identity', {}).get('sourceIp', '')
-
-        if not verify_turnstile(turnstile_token, remote_ip):
-            return response(400, {'verified': False, 'reason': 'Security check failed'})
-
-        vehicle_photos = files.get('vehicle', [])
-        if isinstance(vehicle_photos, bytes):
-            vehicle_photos = [vehicle_photos]
-        title_photo = files.get('title', b'')
-        vin_photo = files.get('vin', b'')
-
-        if not vehicle_photos or not title_photo or not vin_photo:
-            return response(400, {'verified': False, 'reason': 'Missing required photos'})
-
-        submission_id = str(uuid.uuid4())
-
-        def upload_vehicle(i, photo):
-            upload_to_s3(photo, f'{submission_id}/vehicle_{i}.jpg')
-            return photo
-
-        def upload_title():
-            upload_to_s3(title_photo, f'{submission_id}/title.jpg')
-
-        def upload_vin():
-            upload_to_s3(vin_photo, f'{submission_id}/vin.jpg')
-
-        def run_textract_vehicle():
-            return extract_vin_from_image(vehicle_photos[0])
-
-        def run_textract_title():
-            return extract_vin_from_image(title_photo)
-
-        def run_rekognition():
-            for photo in vehicle_photos:
-                wheels_found, confidence = detect_wheels(photo)
-                if wheels_found:
-                    return True, confidence
-            return False, 0.0
-
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = {
-                'textract_vehicle': executor.submit(run_textract_vehicle),
-                'textract_title': executor.submit(run_textract_title),
-                'rekognition': executor.submit(run_rekognition),
-                'upload_title': executor.submit(upload_title),
-                'upload_vin': executor.submit(upload_vin),
-            }
-            for i, photo in enumerate(vehicle_photos):
-                futures[f'upload_vehicle_{i}'] = executor.submit(
-                    upload_vehicle, i, photo)
-
-            vin_from_vehicle = futures['textract_vehicle'].result()
-            vin_from_title = futures['textract_title'].result()
-            wheels_found, confidence = futures['rekognition'].result()
-
-        if not vin_from_vehicle:
-            return response(200, {'verified': False, 'reason': 'Could not read VIN from vehicle photo'})
-
-        if not vin_from_title:
-            return response(200, {'verified': False, 'reason': 'Could not read VIN from title photo'})
-
-        if vin_from_vehicle != vin_from_title:
-            return response(200, {'verified': False, 'reason': 'VIN mismatch'})
-
-        if not wheels_found:
-            return response(200, {'verified': False, 'reason': 'Could not confirm wheels'})
-
-        return response(200, {'verified': True})
+            return response(404, {'error': 'Not found'})
 
     except Exception as e:
         print(f'Unhandled error: {str(e)}')
