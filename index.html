@@ -367,6 +367,120 @@
       .page-wrap { padding: 2rem 1rem 3rem; }
       .header h1 { font-size: 22px; }
     }
+
+    .scheduler {
+      background: var(--surface);
+      border: 0.5px solid var(--border);
+      border-radius: var(--radius-lg);
+      overflow: hidden;
+    }
+    .cal-header {
+      padding: 1rem 1.25rem;
+      border-bottom: 0.5px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .cal-header h2 { font-size: 15px; font-weight: 500; }
+    .cal-nav { display: flex; gap: 8px; }
+    .cal-nav button {
+      background: none;
+      border: 0.5px solid var(--border-strong);
+      border-radius: 6px;
+      width: 28px;
+      height: 28px;
+      cursor: pointer;
+      font-size: 16px;
+      color: var(--text-secondary);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .cal-nav button:hover { background: var(--bg); }
+    .cal-grid {
+      display: grid;
+      grid-template-columns: repeat(7, 1fr);
+      gap: 1px;
+      background: var(--border);
+      border-bottom: 0.5px solid var(--border);
+    }
+    .cal-day-label {
+      background: var(--bg);
+      text-align: center;
+      font-size: 11px;
+      color: var(--text-tertiary);
+      padding: 8px 0;
+      font-weight: 500;
+    }
+    .cal-cell {
+      background: var(--surface);
+      text-align: center;
+      padding: 10px 0;
+      font-size: 13px;
+      color: var(--text-tertiary);
+      cursor: default;
+      min-height: 42px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 3px;
+    }
+    .cal-cell.available { color: var(--text-primary); cursor: pointer; font-weight: 500; }
+    .cal-cell.available:hover { background: var(--bg); }
+    .cal-cell.selected { background: var(--accent); color: #ffffff; }
+    .cal-cell.available.has-slots::after {
+      content: '';
+      display: block;
+      width: 4px;
+      height: 4px;
+      border-radius: 50%;
+      background: #16a34a;
+    }
+    .cal-cell.selected::after { background: #ffffff; }
+    .slots-section { padding: 1.25rem; }
+    .slots-title { font-size: 13px; font-weight: 500; margin-bottom: 0.75rem; color: var(--text-secondary); }
+    .slots-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 1.25rem; }
+    .slot {
+      padding: 10px 8px;
+      border: 0.5px solid var(--border-strong);
+      border-radius: 8px;
+      text-align: center;
+      font-size: 13px;
+      cursor: pointer;
+      background: var(--upload-bg);
+      color: var(--text-primary);
+    }
+    .slot:hover { border-color: var(--accent); }
+    .slot.selected { background: var(--accent); color: #ffffff; border-color: var(--accent); }
+    .slot.claimed { color: var(--text-tertiary); cursor: not-allowed; text-decoration: line-through; }
+    .confirm-btn {
+      width: 100%;
+      padding: 12px;
+      border-radius: var(--radius);
+      border: none;
+      background: var(--accent);
+      font-family: 'DM Sans', sans-serif;
+      font-size: 15px;
+      font-weight: 500;
+      cursor: pointer;
+      color: #ffffff;
+      display: none;
+    }
+    .confirm-btn.visible { display: block; }
+    .confirm-btn:hover { opacity: 0.88; }
+    .confirmed-msg {
+      background: var(--success-bg);
+      border: 0.5px solid var(--success-border);
+      color: var(--success-text);
+      padding: 1.25rem;
+      border-radius: var(--radius);
+      font-size: 14px;
+      line-height: 1.6;
+      display: none;
+    }
+    .confirmed-msg.visible { display: block; }
+    .confirmed-msg .title { font-weight: 500; margin-bottom: 0.4rem; }
   </style>
 </head>
 <body>
@@ -447,10 +561,40 @@
       <p class="sub-text">This usually takes a few seconds. Please do not close this page.</p>
     </div>
 
-    <div class="result-state success" id="success-section">
-      <p class="title">Your submission has been verified.</p>
-      <p>Use the link below to schedule a pickup appointment at a time that works for you.</p>
-      <p style="margin-top: 1rem;"><a id="calendly-link" href="#" target="_blank" rel="noopener noreferrer">Schedule your pickup on Calendly</a></p>
+    <div id="success-section" style="display:none;">
+      <div class="result-state success" style="display:block; margin-bottom: 1.5rem;">
+        <p class="title">Your submission has been verified.</p>
+        <p>Please select a pickup time below.</p>
+      </div>
+
+      <div class="scheduler">
+        <div class="cal-header">
+          <h2 id="cal-month"></h2>
+          <div class="cal-nav">
+            <button onclick="changeMonth(-1)">&#8249;</button>
+            <button onclick="changeMonth(1)">&#8250;</button>
+          </div>
+        </div>
+        <div class="cal-grid" id="cal-grid">
+          <div class="cal-day-label">Sun</div>
+          <div class="cal-day-label">Mon</div>
+          <div class="cal-day-label">Tue</div>
+          <div class="cal-day-label">Wed</div>
+          <div class="cal-day-label">Thu</div>
+          <div class="cal-day-label">Fri</div>
+          <div class="cal-day-label">Sat</div>
+        </div>
+        <div class="slots-section">
+          <div id="slots-container">
+            <p class="slots-title">Select a date to see available times</p>
+          </div>
+          <button class="confirm-btn" id="confirm-btn" onclick="confirmSlot()">Confirm pickup time</button>
+          <div class="confirmed-msg" id="confirmed-msg">
+            <p class="title">Pickup scheduled.</p>
+            <p id="confirmed-text"></p>
+          </div>
+        </div>
+      </div>
     </div>
 
     <div class="result-state danger" id="fail-section">
@@ -468,9 +612,13 @@
     const MAX_FILE_SIZE_MB = 10;
     const MAX_VEHICLE_PHOTOS = 2;
     const API_BASE = 'https://en4maiqyve.execute-api.us-east-1.amazonaws.com';
-    const CALENDLY_URL = 'YOUR_CALENDLY_URL_HERE';
 
     let vehicleFiles = [];
+    let availableSlots = {};
+    let currentYear, currentMonth;
+    let selectedDate = null;
+    let selectedSlot = null;
+    let currentSubmissionId = null;
 
     function validateFile(file) {
       return file.size <= MAX_FILE_SIZE_MB * 1024 * 1024;
@@ -579,6 +727,114 @@
     function show(id) { document.getElementById(id).style.display = 'block'; }
     function hide(id) { document.getElementById(id).style.display = 'none'; }
 
+    function pad(n) { return String(n).padStart(2, '0'); }
+    function dateKey(y, m, d) { return `${y}-${pad(m + 1)}-${pad(d)}`; }
+
+    function renderCalendar() {
+      const grid = document.getElementById('cal-grid');
+      grid.querySelectorAll('.cal-cell').forEach(e => e.remove());
+      const months = ['January','February','March','April','May','June',
+                      'July','August','September','October','November','December'];
+      document.getElementById('cal-month').textContent = `${months[currentMonth]} ${currentYear}`;
+      const firstDay = new Date(currentYear, currentMonth, 1).getDay();
+      const daysInMonth = new Date(currentYear, currentMonth + 1, 0).getDate();
+      for (let i = 0; i < firstDay; i++) {
+        const cell = document.createElement('div');
+        cell.className = 'cal-cell';
+        grid.appendChild(cell);
+      }
+      for (let d = 1; d <= daysInMonth; d++) {
+        const key = dateKey(currentYear, currentMonth, d);
+        const hasSlots = availableSlots[key] && availableSlots[key].length > 0;
+        const cell = document.createElement('div');
+        cell.className = 'cal-cell' + (hasSlots ? ' available has-slots' : '');
+        if (key === selectedDate) cell.classList.add('selected');
+        cell.textContent = d;
+        if (hasSlots) cell.onclick = () => selectDate(key, cell);
+        grid.appendChild(cell);
+      }
+    }
+
+    function selectDate(key, cell) {
+      selectedDate = key;
+      selectedSlot = null;
+      document.getElementById('confirm-btn').classList.remove('visible');
+      document.querySelectorAll('.cal-cell.selected').forEach(c => c.classList.remove('selected'));
+      cell.classList.add('selected');
+      const slots = availableSlots[key] || [];
+      const container = document.getElementById('slots-container');
+      const d = new Date(key + 'T12:00:00');
+      const label = d.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+      container.innerHTML = `<p class="slots-title">${label}</p><div class="slots-grid" id="slots-grid"></div>`;
+      const slotGrid = document.getElementById('slots-grid');
+      slots.forEach(slot => {
+        const btn = document.createElement('div');
+        btn.className = 'slot';
+        btn.textContent = slot;
+        btn.onclick = () => selectSlot(slot, btn);
+        slotGrid.appendChild(btn);
+      });
+    }
+
+    function selectSlot(slot, btn) {
+      selectedSlot = slot;
+      document.querySelectorAll('.slot').forEach(s => s.classList.remove('selected'));
+      btn.classList.add('selected');
+      document.getElementById('confirm-btn').classList.add('visible');
+    }
+
+    async function confirmSlot() {
+      if (!selectedDate || !selectedSlot) return;
+      const btn = document.getElementById('confirm-btn');
+      btn.disabled = true;
+      btn.textContent = 'Confirming...';
+      try {
+        const claimResponse = await fetch(`${API_BASE}/claim`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            date: selectedDate,
+            time: selectedSlot,
+            submission_id: currentSubmissionId
+          })
+        });
+        const result = await claimResponse.json();
+        if (result.claimed) {
+          btn.classList.remove('visible');
+          btn.disabled = false;
+          btn.textContent = 'Confirm pickup time';
+          document.getElementById('slots-container').innerHTML = '';
+          const d = new Date(selectedDate + 'T12:00:00');
+          const label = d.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+          document.getElementById('confirmed-text').textContent =
+            `Your pickup is scheduled for ${label} at ${selectedSlot} Central Time. We will see you then.`;
+          document.getElementById('confirmed-msg').classList.add('visible');
+        } else {
+          btn.disabled = false;
+          btn.textContent = 'Confirm pickup time';
+          alert('That slot is no longer available. Please select another time.');
+          delete availableSlots[selectedDate][availableSlots[selectedDate].indexOf(selectedSlot)];
+          selectDate(selectedDate, document.querySelector('.cal-cell.selected'));
+        }
+      } catch (err) {
+        btn.disabled = false;
+        btn.textContent = 'Confirm pickup time';
+        alert('Something went wrong. Please try again.');
+      }
+    }
+
+    function changeMonth(dir) {
+      currentMonth += dir;
+      if (currentMonth > 11) { currentMonth = 0; currentYear++; }
+      if (currentMonth < 0) { currentMonth = 11; currentYear--; }
+      selectedDate = null;
+      selectedSlot = null;
+      document.getElementById('confirm-btn').classList.remove('visible');
+      document.getElementById('slots-container').innerHTML =
+        '<p class="slots-title">Select a date to see available times</p>';
+      renderCalendar();
+    }
+
     function resetForm() {
       hide('fail-section');
       hide('success-section');
@@ -610,7 +866,7 @@
       const vinFiles = document.getElementById('vin-input').files;
 
       if (vehicleFiles.length < MAX_VEHICLE_PHOTOS) {
-        alert(`Please upload both vehicle photos before submitting.`);
+        alert('Please upload both vehicle photos before submitting.');
         return;
       }
       if (titleFiles.length === 0 || vinFiles.length === 0) {
@@ -628,20 +884,16 @@
       show('loading-section');
 
       try {
-        // Step 1 — request presigned URLs
         const presignResponse = await fetch(`${API_BASE}/presign`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ turnstile: turnstileToken.value })
         });
 
-        if (!presignResponse.ok) {
-          throw new Error('Security check failed');
-        }
+        if (!presignResponse.ok) throw new Error('Security check failed');
+        const { submission_id, urls, keys } = await presignResponse.json();
+        currentSubmissionId = submission_id;
 
-        const { urls, keys } = await presignResponse.json();
-
-        // Step 2 — upload all photos directly to S3 simultaneously
         await Promise.all([
           uploadToS3(urls.vehicle_0, vehicleFiles[0]),
           uploadToS3(urls.vehicle_1, vehicleFiles[1]),
@@ -649,7 +901,6 @@
           uploadToS3(urls.vin, vinFiles[0])
         ]);
 
-        // Step 3 — trigger verification
         const verifyResponse = await fetch(`${API_BASE}/verify`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -660,8 +911,17 @@
         hide('loading-section');
 
         if (result.verified === true) {
-          document.getElementById('calendly-link').href = CALENDLY_URL;
+          const slotsResponse = await fetch(`${API_BASE}/slots`, {
+            method: 'GET',
+            headers: { 'Content-Type': 'application/json' }
+          });
+          const slotsData = await slotsResponse.json();
+          availableSlots = slotsData.slots || {};
+          const now = new Date();
+          currentYear = now.getFullYear();
+          currentMonth = now.getMonth();
           show('success-section');
+          renderCalendar();
         } else {
           show('fail-section');
         }
