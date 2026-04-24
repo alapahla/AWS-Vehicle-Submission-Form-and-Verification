@@ -1,0 +1,376 @@
+import json
+import boto3
+import urllib.request
+import urllib.parse
+import base64
+import concurrent.futures
+import uuid
+import os
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.image import MIMEImage
+
+s3 = boto3.client('s3')
+textract = boto3.client('textract')
+rekognition = boto3.client('rekognition')
+dynamodb = boto3.resource('dynamodb')
+ses = boto3.client('ses')
+
+UPLOADS_BUCKET = os.environ['UPLOADS_BUCKET']
+TURNSTILE_SECRET = os.environ['TURNSTILE_SECRET']
+RECEIVER_EMAIL = os.environ['RECEIVER_EMAIL']
+SENDER_EMAIL = os.environ['SENDER_EMAIL']
+WHEEL_CONFIDENCE_THRESHOLD = 90.0
+WHEEL_LABELS = {'wheel', 'tire', 'tyre', 'alloy wheel', 'spoke'}
+PRESIGN_EXPIRY = 300
+CENTRAL = ZoneInfo('America/Chicago')
+SLOT_DAYS = {5, 6}  # Saturday=5, Sunday=6
+SLOT_HOURS = [9, 12, 15, 18]  # 9 AM, 12 PM, 3 PM, 6 PM
+BOOKING_WINDOW_DAYS = 21
+
+slots_table = dynamodb.Table('vehicle-pickup-slots')
+overrides_table = dynamodb.Table('vehicle-pickup-overrides')
+
+
+# ── Turnstile ──────────────────────────────────────────────────────────────
+
+def verify_turnstile(token, remote_ip):
+    data = urllib.parse.urlencode({
+        'secret': TURNSTILE_SECRET,
+        'response': token,
+        'remoteip': remote_ip
+    }).encode()
+    req = urllib.request.Request(
+        'https://challenges.cloudflare.com/turnstile/v0/siteverify',
+        data=data,
+        method='POST'
+    )
+    with urllib.request.urlopen(req, timeout=5) as res:
+        result = json.loads(res.read())
+    return result.get('success', False)
+
+
+# ── S3 ─────────────────────────────────────────────────────────────────────
+
+def generate_presigned_urls(submission_id):
+    keys = {
+        'vehicle_0': f'{submission_id}/vehicle_0.jpg',
+        'vehicle_1': f'{submission_id}/vehicle_1.jpg',
+        'title':     f'{submission_id}/title.jpg',
+        'vin':       f'{submission_id}/vin.jpg',
+    }
+    urls = {}
+    for field, key in keys.items():
+        urls[field] = s3.generate_presigned_url(
+            'put_object',
+            Params={
+                'Bucket': UPLOADS_BUCKET,
+                'Key': key,
+                'ContentType': 'image/jpeg'
+            },
+            ExpiresIn=PRESIGN_EXPIRY
+        )
+    return urls, keys
+
+
+def get_s3_object(key):
+    response = s3.get_object(Bucket=UPLOADS_BUCKET, Key=key)
+    return response['Body'].read()
+
+
+# ── Textract ───────────────────────────────────────────────────────────────
+
+def extract_vin(image_bytes):
+    response = textract.detect_document_text(
+        Document={'Bytes': image_bytes}
+    )
+    for block in response['Blocks']:
+        if block['BlockType'] == 'LINE':
+            cleaned = block['Text'].strip().replace(' ', '').upper()
+            if len(cleaned) == 17 and cleaned.isalnum():
+                return cleaned
+    return None
+
+
+# ── Rekognition ────────────────────────────────────────────────────────────
+
+def detect_wheels_in_image(image_bytes):
+    response = rekognition.detect_labels(
+        Image={'Bytes': image_bytes},
+        MaxLabels=50,
+        MinConfidence=50.0
+    )
+    for label in response['Labels']:
+        if label['Name'].lower() in WHEEL_LABELS:
+            if label['Confidence'] >= WHEEL_CONFIDENCE_THRESHOLD:
+                return True, label['Confidence']
+    return False, 0.0
+
+
+# ── Scheduling ─────────────────────────────────────────────────────────────
+
+def get_overrides():
+    result = overrides_table.scan()
+    overrides = {}
+    for item in result.get('Items', []):
+        overrides[item['override_date']] = item
+    return overrides
+
+
+def get_claimed_slots():
+    result = slots_table.scan()
+    claimed = {}
+    for item in result.get('Items', []):
+        date = item['date']
+        time = item['time']
+        if date not in claimed:
+            claimed[date] = set()
+        claimed[date].add(time)
+    return claimed
+
+
+def hour_to_label(hour):
+    if hour == 0:
+        return '12:00 AM'
+    elif hour < 12:
+        return f'{hour}:00 AM'
+    elif hour == 12:
+        return '12:00 PM'
+    else:
+        return f'{hour - 12}:00 PM'
+
+
+def generate_slots_for_date(date_str, hours):
+    return [hour_to_label(h) for h in hours]
+
+
+def handle_get_slots(event):
+    now = datetime.now(CENTRAL)
+    today = now.date()
+    overrides = get_overrides()
+    claimed = get_claimed_slots()
+    available = {}
+
+    for i in range(BOOKING_WINDOW_DAYS):
+        date = today + timedelta(days=i)
+        date_str = date.strftime('%Y-%m-%d')
+        override = overrides.get(date_str)
+
+        if override:
+            override_type = override.get('type')
+            if override_type == 'block':
+                continue
+            elif override_type == 'replace':
+                hours = [int(h) for h in override.get('hours', [])]
+                slots = generate_slots_for_date(date_str, hours)
+            elif override_type == 'add':
+                hours = [int(h) for h in override.get('hours', [])]
+                slots = generate_slots_for_date(date_str, hours)
+            else:
+                continue
+        elif date.weekday() in SLOT_DAYS:
+            slots = generate_slots_for_date(date_str, SLOT_HOURS)
+        else:
+            continue
+
+        claimed_for_date = claimed.get(date_str, set())
+        available_slots = [s for s in slots if s not in claimed_for_date]
+
+        if available_slots:
+            available[date_str] = available_slots
+
+    return response(200, {'slots': available})
+
+
+def handle_claim_slot(event):
+    body = parse_json_body(event)
+    date = body.get('date')
+    time = body.get('time')
+    submission_id = body.get('submission_id')
+    location = body.get('location', 'No location provided')
+
+    if not date or not time or not submission_id:
+        return response(400, {'claimed': False, 'reason': 'Missing required fields'})
+
+    slot_id = f'{date}#{time}'
+
+    pickup_dt = datetime.strptime(date, '%Y-%m-%d').replace(tzinfo=CENTRAL)
+    ttl = int((pickup_dt + timedelta(days=1)).timestamp())
+
+    try:
+        slots_table.put_item(
+            Item={
+                'slot_id': slot_id,
+                'date': date,
+                'time': time,
+                'submission_id': submission_id,
+                'location': location,
+                'ttl': ttl
+            },
+            ConditionExpression='attribute_not_exists(slot_id)'
+        )
+    except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
+        return response(200, {'claimed': False, 'reason': 'Slot no longer available'})
+
+    try:
+        vehicle_photo_bytes = get_s3_object(f'{submission_id}/vehicle_0.jpg')
+        send_notification_email(date, time, submission_id, location, vehicle_photo_bytes)
+    except Exception as e:
+        print(f'Email error: {str(e)}')
+
+    return response(200, {'claimed': True})
+
+
+def send_notification_email(date, time, submission_id, location, vehicle_photo_bytes):
+    msg = MIMEMultipart('mixed')
+    msg['Subject'] = 'New Vehicle Pickup Scheduled'
+    msg['From'] = SENDER_EMAIL
+    msg['To'] = RECEIVER_EMAIL
+
+    body_text = (
+        f'A pickup has been scheduled.\n\n'
+        f'Date: {date}\n'
+        f'Time: {time} Central Time\n'
+        f'Location: {location}\n'
+        f'Submission ID: {submission_id}'
+    )
+
+    msg.attach(MIMEText(body_text, 'plain'))
+
+    img = MIMEImage(vehicle_photo_bytes, _subtype='jpeg')
+    img.add_header('Content-Disposition', 'attachment', filename='vehicle.jpg')
+    msg.attach(img)
+
+    ses.send_raw_email(
+        Source=SENDER_EMAIL,
+        Destinations=[RECEIVER_EMAIL],
+        RawMessage={'Data': msg.as_string()}
+    )
+
+
+# ── Verification ───────────────────────────────────────────────────────────
+
+def handle_presign(event):
+    body = parse_json_body(event)
+    turnstile_token = body.get('turnstile', '')
+    remote_ip = (event.get('requestContext', {})
+                 .get('http', {})
+                 .get('sourceIp', ''))
+
+    if not verify_turnstile(turnstile_token, remote_ip):
+        return response(400, {'error': 'Security check failed'})
+
+    submission_id = str(uuid.uuid4())
+    urls, keys = generate_presigned_urls(submission_id)
+
+    return response(200, {
+        'submission_id': submission_id,
+        'urls': urls,
+        'keys': keys
+    })
+
+
+def handle_verify(event):
+    body = parse_json_body(event)
+    keys = body.get('keys', {})
+
+    required = ['vehicle_0', 'vehicle_1', 'title', 'vin']
+    if not all(k in keys for k in required):
+        return response(400, {'verified': False, 'reason': 'Missing file keys'})
+
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        future_vehicle_0 = executor.submit(get_s3_object, keys['vehicle_0'])
+        future_vehicle_1 = executor.submit(get_s3_object, keys['vehicle_1'])
+        future_title     = executor.submit(get_s3_object, keys['title'])
+        future_vin       = executor.submit(get_s3_object, keys['vin'])
+
+        vehicle_0_bytes = future_vehicle_0.result()
+        vehicle_1_bytes = future_vehicle_1.result()
+        title_bytes     = future_title.result()
+        vin_bytes       = future_vin.result()
+
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        future_vin_from_vin_photo = executor.submit(extract_vin, vin_bytes)
+        future_vin_from_title     = executor.submit(extract_vin, title_bytes)
+        future_wheels_0           = executor.submit(detect_wheels_in_image, vehicle_0_bytes)
+        future_wheels_1           = executor.submit(detect_wheels_in_image, vehicle_1_bytes)
+
+        vin_from_vin_photo = future_vin_from_vin_photo.result()
+        vin_from_title     = future_vin_from_title.result()
+        wheels_0_found, confidence_0 = future_wheels_0.result()
+        wheels_1_found, confidence_1 = future_wheels_1.result()
+
+    if not vin_from_vin_photo:
+        return response(200, {'verified': False,
+                              'reason': 'Could not read VIN from VIN photo'})
+    if not vin_from_title:
+        return response(200, {'verified': False,
+                              'reason': 'Could not read VIN from title photo'})
+    if vin_from_vin_photo != vin_from_title:
+        return response(200, {'verified': False,
+                              'reason': 'VIN does not match title'})
+    if not wheels_0_found:
+        return response(200, {'verified': False,
+                              'reason': 'Could not confirm wheels in first vehicle photo'})
+    if not wheels_1_found:
+        return response(200, {'verified': False,
+                              'reason': 'Could not confirm wheels in second vehicle photo'})
+
+    return response(200, {'verified': True})
+
+
+# ── Shared ─────────────────────────────────────────────────────────────────
+
+def parse_json_body(event):
+    body = event.get('body', '{}')
+    if event.get('isBase64Encoded', False):
+        body = base64.b64decode(body).decode('utf-8')
+    return json.loads(body)
+
+
+def response(status_code, body):
+    return {
+        'statusCode': status_code,
+        'headers': {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*'
+        },
+        'body': json.dumps(body)
+    }
+
+
+# ── Router ─────────────────────────────────────────────────────────────────
+
+def lambda_handler(event, context):
+    try:
+        path = event.get('rawPath', '')
+        method = event.get('requestContext', {}).get('http', {}).get('method', '')
+
+        if method == 'OPTIONS':
+            return {
+                'statusCode': 200,
+                'headers': {
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                    'Access-Control-Allow-Headers': 'Content-Type',
+                    'Access-Control-Max-Age': '300'
+                },
+                'body': ''
+            }
+
+        if path == '/presign' and method == 'POST':
+            return handle_presign(event)
+        elif path == '/verify' and method == 'POST':
+            return handle_verify(event)
+        elif path == '/slots' and method == 'GET':
+            return handle_get_slots(event)
+        elif path == '/claim' and method == 'POST':
+            return handle_claim_slot(event)
+        else:
+            return response(404, {'error': 'Not found'})
+
+    except Exception as e:
+        print(f'Unhandled error: {str(e)}')
+        return response(500, {'error': 'Internal error'})
